@@ -9,22 +9,25 @@ const jwt = require("jsonwebtoken");
 
 const app = express();
 
-// 🔑 CONFIG
-const stripe = Stripe("sk_test_51TRswyS0KB9oyDfgsKwX66Soytt0gYDXBvVfUuEtwGafMC12GJF7dKjmbNzyhvhlngmwmU51LVVPIERpo7XhTjAx00qPDGsGnf");
-const JWT_SECRET = "supersecretkey";
-const endpointSecret = "sk_test_51TRswyS0KB9oyDfgsKwX66Soytt0gYDXBvVfUuEtwGafMC12GJF7dKjmbNzyhvhlngmwmU51LVVPIERpo7XhTjAx00qPDGsGnf";
+// ✅ ENV VARIABLES (SET THESE IN RENDER)
+const stripe = Stripe(process.env.STRIPE_SECRET);
+const JWT_SECRET = process.env.JWT_SECRET;
+const BASE_URL = process.env.BASE_URL;
 
-// ⚠️ RAW body ONLY for webhook
-app.post("/webhook", express.raw({ type: "application/json" }));
-
-app.use(cors());
+// MIDDLEWARE
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use("/uploads", express.static("uploads"));
 
-// -------- DATABASE --------
-mongoose.connect("mongodb://127.0.0.1:27017/feetapp")
+// -------- DATABASE (FIXED FOR RENDER) --------
+mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB connected"))
   .catch(err => console.log(err));
+
+// -------- ROOT FIX --------
+app.get("/", (req, res) => {
+  res.send("Backend is live");
+});
 
 // -------- MODELS --------
 const User = mongoose.model("User", {
@@ -33,7 +36,7 @@ const User = mongoose.model("User", {
   bio: String,
   avatar: String,
   stripeAccountId: String,
-  subscriptions: [String] // creator emails
+  subscriptions: [String]
 });
 
 const Image = mongoose.model("Image", {
@@ -104,12 +107,10 @@ const upload = multer({ storage });
 app.post("/update-profile", auth, upload.single("avatar"), async (req, res) => {
   const user = await User.findOne({ email: req.user.email });
 
-  if (!user) return res.status(404).send("User not found");
-
   if (req.body.bio) user.bio = req.body.bio;
 
   if (req.file) {
-    user.avatar = `http://localhost:5000/uploads/${req.file.filename}`;
+    user.avatar = `${BASE_URL}/uploads/${req.file.filename}`;
   }
 
   await user.save();
@@ -118,7 +119,7 @@ app.post("/update-profile", auth, upload.single("avatar"), async (req, res) => {
 
 // -------- UPLOAD IMAGE --------
 app.post("/upload", auth, upload.single("image"), async (req, res) => {
-  const url = `http://localhost:5000/uploads/${req.file.filename}`;
+  const url = `${BASE_URL}/uploads/${req.file.filename}`;
 
   await new Image({
     url,
@@ -128,11 +129,9 @@ app.post("/upload", auth, upload.single("image"), async (req, res) => {
   res.json({ url });
 });
 
-// -------- CONNECT STRIPE (CREATOR ONBOARDING) --------
+// -------- CONNECT STRIPE --------
 app.post("/connect-account", auth, async (req, res) => {
-  const account = await stripe.accounts.create({
-    type: "express"
-  });
+  const account = await stripe.accounts.create({ type: "express" });
 
   const user = await User.findOne({ email: req.user.email });
   user.stripeAccountId = account.id;
@@ -140,15 +139,15 @@ app.post("/connect-account", auth, async (req, res) => {
 
   const accountLink = await stripe.accountLinks.create({
     account: account.id,
-    refresh_url: "http://localhost:3000",
-    return_url: "http://localhost:3000",
+    refresh_url: BASE_URL,
+    return_url: BASE_URL,
     type: "account_onboarding"
   });
 
   res.json({ url: accountLink.url });
 });
 
-// -------- CREATE SUBSCRIPTION --------
+// -------- SUBSCRIPTION --------
 app.post("/create-subscription", auth, async (req, res) => {
   const { creatorEmail } = req.body;
 
@@ -160,120 +159,20 @@ app.post("/create-subscription", auth, async (req, res) => {
   const session = await stripe.checkout.sessions.create({
     payment_method_types: ["card"],
     mode: "subscription",
-    line_items: [
-      {
-        price_data: {
-          currency: "gbp",
-          product_data: {
-            name: `Subscription to ${creatorEmail}`
-          },
-          unit_amount: 500,
-          recurring: { interval: "month" }
-        },
-        quantity: 1
-      }
-    ],
-    payment_intent_data: {
-      application_fee_amount: 100, // your fee (£1)
-      transfer_data: {
-        destination: creator.stripeAccountId
-      }
-    },
-    metadata: {
-      email: req.user.email,
-      creator: creatorEmail
-    },
-    success_url: `http://localhost:3000/creator/${creatorEmail}?success=true`,
-    cancel_url: `http://localhost:3000/creator/${creatorEmail}`
+    line_items: [{
+      price_data: {
+        currency: "gbp",
+        product_data: { name: `Subscription to ${creatorEmail}` },
+        unit_amount: 500,
+        recurring: { interval: "month" }
+      },
+      quantity: 1
+    }],
+    success_url: `${BASE_URL}?success=true`,
+    cancel_url: BASE_URL
   });
 
   res.json({ url: session.url });
-});
-
-// -------- WEBHOOK (SECURE PAYMENT CONFIRMATION) --------
-app.post("/webhook", async (req, res) => {
-  const sig = req.headers["stripe-signature"];
-
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      endpointSecret
-    );
-  } catch (err) {
-    console.log("Webhook error:", err.message);
-    return res.sendStatus(400);
-  }
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-
-    const email = session.metadata.email;
-    const creator = session.metadata.creator;
-
-    const user = await User.findOne({ email });
-
-    if (user && !user.subscriptions.includes(creator)) {
-      user.subscriptions.push(creator);
-      await user.save();
-      console.log("Subscription saved:", email, "->", creator);
-    }
-  }
-
-  res.sendStatus(200);
-});
-
-// -------- CREATOR PROFILE --------
-app.get("/creator/:email", auth, async (req, res) => {
-  const creator = await User.findOne({ email: req.params.email });
-  const viewer = await User.findOne({ email: req.user.email });
-
-  const isSubscribed = viewer.subscriptions.includes(req.params.email);
-
-  const images = isSubscribed
-    ? await Image.find({ owner: req.params.email })
-    : [];
-
-  res.json({
-    email: creator.email,
-    bio: creator.bio,
-    avatar: creator.avatar,
-    images,
-    isSubscribed
-  });
-});
-
-// -------- EARNINGS DASHBOARD --------
-app.get("/earnings", auth, async (req, res) => {
-  const user = await User.findOne({ email: req.user.email });
-
-  if (!user.stripeAccountId) {
-    return res.json({ error: "Not connected to Stripe" });
-  }
-
-  try {
-    const balance = await stripe.balance.retrieve({
-      stripeAccount: user.stripeAccountId
-    });
-
-    const charges = await stripe.charges.list({
-      limit: 10
-    });
-
-    res.json({
-      available: balance.available[0]?.amount || 0,
-      pending: balance.pending[0]?.amount || 0,
-      recent: charges.data.map(c => ({
-        amount: c.amount,
-        created: c.created
-      }))
-    });
-
-  } catch (err) {
-    res.status(500).send("Stripe error");
-  }
 });
 
 // -------- START SERVER --------
